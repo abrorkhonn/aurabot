@@ -1,87 +1,166 @@
 import asyncio
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
-from aiogram.filters import Command
+from datetime import datetime, timedelta
+import re
 import sqlite3
 import os
 
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 957041356  # <--- замени на свой ID
+ADMIN_ID = 957041356  # замените на ваш Telegram ID
 
 bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# Подключение к БД
 conn = sqlite3.connect("aura.db")
 cursor = conn.cursor()
 cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        aura INTEGER DEFAULT 0
-    )
+CREATE TABLE IF NOT EXISTS aura (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    aura INTEGER DEFAULT 0
+)
+""")
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender_id INTEGER,
+    receiver_id INTEGER,
+    value INTEGER,
+    timestamp TEXT
+)
 """)
 conn.commit()
 
-def change_aura(user_id, username, delta):
-    cursor.execute("SELECT aura FROM users WHERE user_id = ?", (user_id,))
+def get_user_aura(user_id):
+    cursor.execute("SELECT aura FROM aura WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
-    if result:
-        cursor.execute("UPDATE users SET aura = aura + ?, username = ? WHERE user_id = ?", (delta, username, user_id))
-    else:
-        cursor.execute("INSERT INTO users (user_id, username, aura) VALUES (?, ?, ?)", (user_id, username, delta))
+    return result[0] if result else 0
+
+def update_user_aura(user_id, username, value):
+    cursor.execute("INSERT OR IGNORE INTO aura (user_id, username, aura) VALUES (?, ?, ?)", (user_id, username, 0))
+    cursor.execute("UPDATE aura SET aura = aura + ?, username = ? WHERE user_id = ?", (value, username, user_id))
     conn.commit()
 
-@dp.message()
-async def handle_aura_messages(message: Message):
-    if not message.reply_to_message:
-        return
+def save_history(sender_id, receiver_id, value):
+    cursor.execute("INSERT INTO history (sender_id, receiver_id, value, timestamp) VALUES (?, ?, ?, ?)",
+                   (sender_id, receiver_id, value, datetime.utcnow().isoformat()))
+    conn.commit()
 
-    text = message.text.strip()
-    if text == "++":
-        target = message.reply_to_message.from_user
-        change_aura(target.id, target.username or target.full_name, 1)
-        await message.reply(f"👍 +1 к ауре для {target.full_name}")
-    elif text == "--":
-        target = message.reply_to_message.from_user
-        change_aura(target.id, target.username or target.full_name, -1)
-        await message.reply(f"👎 -1 от ауры для {target.full_name}")
+def daily_limits(sender_id, receiver_id, value):
+    today = datetime.utcnow().date()
+    cursor.execute("""
+    SELECT SUM(value) FROM history 
+    WHERE sender_id = ? AND DATE(timestamp) = ?
+    """, (sender_id, today))
+    total = cursor.fetchone()[0] or 0
+
+    cursor.execute("""
+    SELECT SUM(value) FROM history 
+    WHERE sender_id = ? AND receiver_id = ? AND DATE(timestamp) = ?
+    """, (sender_id, receiver_id, today))
+    to_one = cursor.fetchone()[0] or 0
+
+    total_limit = abs(total + value) <= 500
+    one_limit = abs(to_one + value) <= 200
+    return total_limit, one_limit
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer("👋 Привет! Используй `@username +100` или `-100` чтобы изменить ауру другим.\n\nПосмотреть ауру: /aura @username\nТоп: /top")
+
+@dp.message(Command("aura"))
+async def get_aura(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await message.reply("Используй /aura @username")
+        return
+    username = args[1].lstrip("@")
+    cursor.execute("SELECT aura FROM aura WHERE username = ?", (username,))
+    result = cursor.fetchone()
+    if result:
+        await message.answer(f"✨ Аура @{username}: {result[0]}")
+    else:
+        await message.answer("Пользователь не найден.")
 
 @dp.message(Command("top"))
-async def top_users(message: Message):
-    cursor.execute("SELECT username, aura FROM users ORDER BY aura DESC LIMIT 10")
+async def top(message: Message):
+    cursor.execute("SELECT username, aura FROM aura ORDER BY aura DESC LIMIT 10")
     rows = cursor.fetchall()
-    if not rows:
-        await message.reply("Пока нет данных.")
-        return
     text = "<b>🏆 Топ по ауре:</b>\n\n"
-    for i, (username, aura) in enumerate(rows, start=1):
-        name = f"@{username}" if username else "Без имени"
-        text += f"{i}. {name} — {aura}\n"
-    await message.reply(text)
+    for i, (username, aura) in enumerate(rows, 1):
+        text += f"{i}. @{username} — {aura}\n"
+    await message.answer(text)
 
-@dp.message(Command("set_aura"))
+@dp.message(Command("setaura"))
 async def set_aura(message: Message):
     if message.from_user.id != ADMIN_ID:
-        await message.reply("У тебя нет прав на выполнение этой команды.")
+        await message.answer("У тебя нет прав для этой команды.")
         return
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer("Используй: /setaura @username число")
+        return
+    username = args[1].lstrip("@")
     try:
-        parts = message.text.split()
-        if len(parts) != 3:
-            raise ValueError
-        username = parts[1].lstrip('@')
-        new_value = int(parts[2])
-        cursor.execute("SELECT user_id FROM users WHERE username = ?", (username,))
-        result = cursor.fetchone()
-        if result:
-            cursor.execute("UPDATE users SET aura = ? WHERE username = ?", (new_value, username))
-            conn.commit()
-            await message.reply(f"✅ Аура пользователя @{username} установлена на {new_value}.")
-        else:
-            await message.reply("Пользователь не найден.")
+        value = int(args[2])
     except:
-        await message.reply("Используй формат: /set_aura @username 10")
+        await message.answer("Значение должно быть числом.")
+        return
+    cursor.execute("SELECT user_id FROM aura WHERE username = ?", (username,))
+    result = cursor.fetchone()
+    if result:
+        user_id = result[0]
+        cursor.execute("UPDATE aura SET aura = ? WHERE user_id = ?", (value, user_id))
+        conn.commit()
+        await message.answer(f"✅ Аура @{username} установлена на {value}.")
+    else:
+        await message.answer("Пользователь не найден.")
+
+@dp.message()
+async def handle_aura_change(message: Message):
+    if not message.entities:
+        return
+    mentioned = [e for e in message.entities if e.type == "mention"]
+    if not mentioned:
+        return
+    match = re.search(r'([+-]\d+)', message.text)
+    if not match:
+        return
+    value = int(match.group(1))
+    if value == 0:
+        return
+    username = message.text[mentioned[0].offset+1:mentioned[0].offset+mentioned[0].length]
+    cursor.execute("SELECT user_id FROM aura WHERE username = ?", (username,))
+    user = cursor.fetchone()
+
+    if username == message.from_user.username:
+        await message.reply("❌ Нельзя менять свою ауру.")
+        return
+
+    if not user:
+        # создаём если ещё нет
+        cursor.execute("INSERT INTO aura (username, aura, user_id) VALUES (?, 0, ?)", (username, 999999999))
+        conn.commit()
+        cursor.execute("SELECT user_id FROM aura WHERE username = ?", (username,))
+        user = cursor.fetchone()
+
+    receiver_id = user[0]
+    sender_id = message.from_user.id
+
+    ok1, ok2 = daily_limits(sender_id, receiver_id, value)
+    if not ok1:
+        await message.reply("❌ Превышен дневной лимит +500 / -500.")
+        return
+    if not ok2:
+        await message.reply("❌ Нельзя дать больше +200 или -200 одному человеку в день.")
+        return
+
+    update_user_aura(receiver_id, username, value)
+    save_history(sender_id, receiver_id, value)
+    await message.reply(f"{'✨' if value > 0 else '💢'} @{username} {'получает' if value > 0 else 'теряет'} {abs(value)} ауры!")
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
