@@ -1,10 +1,11 @@
-import os
-import sqlite3
 from aiogram import Bot, Dispatcher, types
+from aiogram.dispatcher import Dispatcher
+from aiogram.dispatcher.filters import Command
 from aiogram.types import Message
 from aiogram.utils import executor
-from aiogram.filters import Command
-from dotenv import load_dotenv
+import sqlite3
+import logging
+import os
 
 # Загрузка .env
 load_dotenv()
