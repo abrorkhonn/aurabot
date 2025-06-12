@@ -1,50 +1,98 @@
+import asyncio
 import os
-import logging
+import sqlite3
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, types
-from aiogram.dispatcher.filters import Command
-from aiogram.utils import executor
-from db import init_db, change_aura, get_aura
 
+# Загрузка токена
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN не найден!")
+TOKEN = os.getenv("BOT_TOKEN")
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(bot)
+# Инициализация бота и диспетчера
+bot = Bot(token=TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher(storage=MemoryStorage())
 
-init_db()
+# Создание таблицы, если нет
+def init_db():
+    conn = sqlite3.connect("aura.db")
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            aura INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-@dp.message_handler(Command("start"))
-async def start_handler(message: types.Message):
-    await message.answer("Привет! Я бот, и я работаю 🎉")
+# Получить ауру
+def get_aura(user_id: int) -> int:
+    conn = sqlite3.connect("aura.db")
+    cur = conn.cursor()
+    cur.execute("SELECT aura FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
 
-@dp.message_handler(lambda m: m.text.startswith("+аура") or m.text.startswith("-аура"))
-async def aura_handler(message: types.Message):
-    parts = message.text.split()
-    if len(parts) < 2 or not message.entities:
-        await message.reply("Укажи пользователя: +аура @username или -аура @username")
-        return
+# Изменить ауру
+def change_aura(user_id: int, amount: int):
+    conn = sqlite3.connect("aura.db")
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+    cur.execute("UPDATE users SET aura = aura + ? WHERE user_id = ?", (amount, user_id))
+    conn.commit()
+    conn.close()
 
-    target = message.entities[1]
-    if target.type != "mention":
-        await message.reply("Нужен @username")
-        return
+# Кнопки "Добавить/Убавить"
+def get_keyboard(user_id: int) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Add Aura", callback_data=f"add:{user_id}")
+    kb.button(text="➖ Remove Aura", callback_data=f"remove:{user_id}")
+    kb.adjust(2)
+    return kb
 
-    username = message.text[target.offset+1:target.offset+target.length]
-    # Ищем ID по username (на основе реплая или сохранённых ранее данных)
-    if not message.reply_to_message:
-        await message.reply("Пока поддерживается только через ответ на сообщение")
-        return
+# Команда /start
+@dp.message(F.text == "/start")
+async def start_handler(message: Message):
+    aura = get_aura(message.from_user.id)
+    await message.answer(
+        f"👋 Hello, {message.from_user.full_name}!\nYour aura: <b>{aura}</b>",
+        reply_markup=get_keyboard(message.from_user.id).as_markup()
+    )
 
-    user = message.reply_to_message.from_user
-    delta = 1 if message.text.startswith("+аура") else -1
-    change_aura(user.id, user.username or username, delta)
-    current = get_aura(user.id)
+# Обработка кнопок
+@dp.callback_query(F.data.startswith("add:"))
+async def add_aura(callback: CallbackQuery):
+    target_id = int(callback.data.split(":")[1])
+    change_aura(target_id, +1)
+    aura = get_aura(target_id)
+    await callback.message.edit_text(
+        f"🌟 Aura increased!\nCurrent aura: <b>{aura}</b>",
+        reply_markup=get_keyboard(target_id).as_markup()
+    )
+    await callback.answer("Added aura!")
 
-    await message.reply(f"✨ Аура пользователя @{user.username or username}: {current}")
+@dp.callback_query(F.data.startswith("remove:"))
+async def remove_aura(callback: CallbackQuery):
+    target_id = int(callback.data.split(":")[1])
+    change_aura(target_id, -1)
+    aura = get_aura(target_id)
+    await callback.message.edit_text(
+        f"🌑 Aura decreased!\nCurrent aura: <b>{aura}</b>",
+        reply_markup=get_keyboard(target_id).as_markup()
+    )
+    await callback.answer("Removed aura!")
+
+# Основной запуск
+async def main():
+    init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("Bot is polling...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
